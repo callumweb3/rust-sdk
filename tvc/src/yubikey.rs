@@ -145,11 +145,24 @@ pub(crate) enum DeviceError {
         "the {slot} slot holds a non-QuorumOS certificate ({subject}); refusing to touch this device"
     )]
     ForeignSlot { slot: QosSlot, subject: String },
+    /// The slot holds no key; the device is not fully provisioned.
+    #[error("the {slot} slot holds no QuorumOS key")]
+    EmptySlot { slot: QosSlot },
+    #[error("the YubiKey PIN was rejected; {tries} attempts remain before the PIN locks")]
+    WrongPin { tries: u8 },
     // qos_client's YubiKeyError implements neither Display nor Error, so it
     // is rendered by value instead of chained as a source.
     // TODO: derive those in qos_client and turn these fields into #[source].
     #[error("failed to provision the {slot} slot: {error:?}")]
     Provision { slot: QosSlot, error: YubiKeyError },
+    #[error(
+        "failed to sign with the YubiKey (a missed touch while it blinks times out): {error:?}"
+    )]
+    Sign { error: YubiKeyError },
+    #[error(
+        "failed to compute the YubiKey shared secret (a missed touch while it blinks times out): {error:?}"
+    )]
+    KeyAgreement { error: YubiKeyError },
     #[error("failed to read the operator public key from the device: {error:?}")]
     ReadPairPublicKey { error: YubiKeyError },
     #[error("device returned a malformed operator public key")]
@@ -234,6 +247,27 @@ pub(crate) trait DeviceOps {
         slot: QosSlot,
     ) -> Result<(), DeviceError>;
 
+    /// Sign `message` with the signing-slot key: the message is SHA-256
+    /// digested on the way in and the signature comes back as raw 64-byte
+    /// `r ‖ s`, verified against the slot certificate before returning.
+    /// Requires the PIN and a physical touch.
+    fn sign(
+        &mut self,
+        serial: YubiKeySerial,
+        pin: &Pin,
+        message: &[u8],
+    ) -> Result<Vec<u8>, DeviceError>;
+
+    /// Raw ECDH between the key-agreement slot key and `sender_public`, an
+    /// uncompressed SEC1-encoded P-256 point. Requires the PIN and a
+    /// physical touch.
+    fn key_agreement(
+        &mut self,
+        serial: YubiKeySerial,
+        pin: &Pin,
+        sender_public: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, DeviceError>;
+
     /// Bring the device to the fully provisioned state and return its
     /// operator key.
     ///
@@ -292,6 +326,28 @@ pub(crate) trait DeviceOps {
             .try_for_each(|slot| self.delete_qos_certificate(serial, *slot))?;
 
         Ok(DeletedMaterial { cleared_slots })
+    }
+
+    /// Verify both QuorumOS slots hold TVC-provisioned keys and return the
+    /// device's composite operator key. Refuses on a foreign or empty slot.
+    fn verified_pair_public_key(
+        &mut self,
+        serial: YubiKeySerial,
+    ) -> Result<QosOperatorPublicKey, DeviceError> {
+        let status = self.status(serial)?;
+
+        if let Some((slot, subject)) = status.foreign_slot() {
+            return Err(DeviceError::ForeignSlot {
+                slot,
+                subject: subject.to_string(),
+            });
+        }
+
+        if let Some(slot) = status.slots_with(SlotStatus::Empty).into_iter().next() {
+            return Err(DeviceError::EmptySlot { slot });
+        }
+
+        self.pair_public_key(serial)
     }
 }
 
@@ -400,6 +456,42 @@ impl DeviceOps for PcscDevices {
         Certificate::delete(&mut yubikey, slot.slot_id())
             .map_err(|source| DeviceError::DeleteCertificate { slot, source })
     }
+
+    fn sign(
+        &mut self,
+        serial: YubiKeySerial,
+        pin: &Pin,
+        message: &[u8],
+    ) -> Result<Vec<u8>, DeviceError> {
+        let mut yubikey = Self::open(serial)?;
+
+        qos_client::yubikey::sign_data(&mut yubikey, message, pin.as_bytes()).map_err(|error| {
+            match error {
+                YubiKeyError::FailedToVerifyPin(PivError::WrongPin { tries }) => {
+                    DeviceError::WrongPin { tries }
+                }
+                error => DeviceError::Sign { error },
+            }
+        })
+    }
+
+    fn key_agreement(
+        &mut self,
+        serial: YubiKeySerial,
+        pin: &Pin,
+        sender_public: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, DeviceError> {
+        let mut yubikey = Self::open(serial)?;
+
+        qos_client::yubikey::key_agreement(&mut yubikey, sender_public, pin.as_bytes()).map_err(
+            |error| match error {
+                YubiKeyError::FailedToVerifyPin(PivError::WrongPin { tries }) => {
+                    DeviceError::WrongPin { tries }
+                }
+                error => DeviceError::KeyAgreement { error },
+            },
+        )
+    }
 }
 
 /// YubiKey semantics of the registry [`Config`] holds; the methods live
@@ -467,132 +559,20 @@ impl Config {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::{FakeDevice, serial};
     use super::*;
     use crate::config::turnkey::{OperatorRecord, OrgConfig, YubiKeyOperatorRecord};
+    use p256::PublicKey;
+    use p256::ecdh::diffie_hellman;
+    use qos_p256::{P256Pair, P256Public};
     use std::collections::HashMap;
-
-    fn serial() -> YubiKeySerial {
-        YubiKeySerial::from(0x01c9_5c1f)
-    }
 
     fn pair_key() -> QosOperatorPublicKey {
         QosOperatorPublicKey::try_from([7u8; 130].as_slice()).unwrap()
-    }
-
-    /// In-memory [`DeviceOps`] implementation: per-slot state plus
-    /// scriptable primitive failures, recording every mutating call.
-    struct FakeDevice {
-        devices: Vec<(YubiKeySerial, DeviceStatus)>,
-        fail_provision: Option<QosSlot>,
-        fail_delete: Option<QosSlot>,
-        provision_calls: Vec<QosSlot>,
-        delete_calls: Vec<QosSlot>,
-    }
-
-    impl FakeDevice {
-        fn new(signing: SlotStatus, key_agreement: SlotStatus) -> Self {
-            Self {
-                devices: vec![(
-                    serial(),
-                    DeviceStatus {
-                        signing,
-                        key_agreement,
-                    },
-                )],
-                fail_provision: None,
-                fail_delete: None,
-                provision_calls: Vec::new(),
-                delete_calls: Vec::new(),
-            }
-        }
-
-        fn device_status(
-            &mut self,
-            serial: YubiKeySerial,
-        ) -> Result<&mut DeviceStatus, DeviceError> {
-            self.devices
-                .iter_mut()
-                .find(|(candidate, _)| *candidate == serial)
-                .map(|(_, status)| status)
-                .ok_or(DeviceError::NotFound { serial })
-        }
-
-        fn slot_status(status: &mut DeviceStatus, slot: QosSlot) -> &mut SlotStatus {
-            match slot {
-                QosSlot::Signing => &mut status.signing,
-                QosSlot::KeyAgreement => &mut status.key_agreement,
-            }
-        }
-    }
-
-    impl DeviceOps for FakeDevice {
-        fn connected_serials(&mut self) -> Result<Vec<YubiKeySerial>, DeviceError> {
-            Ok(self.devices.iter().map(|(serial, _)| *serial).collect())
-        }
-
-        fn status(&mut self, serial: YubiKeySerial) -> Result<DeviceStatus, DeviceError> {
-            self.device_status(serial).map(|status| status.clone())
-        }
-
-        fn provision_slot(
-            &mut self,
-            serial: YubiKeySerial,
-            slot: QosSlot,
-            _pin: &Pin,
-        ) -> Result<(), DeviceError> {
-            self.provision_calls.push(slot);
-
-            if self.fail_provision == Some(slot) {
-                return Err(DeviceError::Provision {
-                    slot,
-                    error: YubiKeyError::WillNotOverwriteSlot,
-                });
-            }
-
-            let status = self.device_status(serial)?;
-            *Self::slot_status(status, slot) = SlotStatus::QosProvisioned;
-            Ok(())
-        }
-
-        fn pair_public_key(
-            &mut self,
-            serial: YubiKeySerial,
-        ) -> Result<QosOperatorPublicKey, DeviceError> {
-            let status = self.device_status(serial)?;
-
-            if *status
-                == (DeviceStatus {
-                    signing: SlotStatus::QosProvisioned,
-                    key_agreement: SlotStatus::QosProvisioned,
-                })
-            {
-                Ok(pair_key())
-            } else {
-                Err(DeviceError::ReadPairPublicKey {
-                    error: YubiKeyError::CannotFindSigningKey,
-                })
-            }
-        }
-
-        fn delete_qos_certificate(
-            &mut self,
-            serial: YubiKeySerial,
-            slot: QosSlot,
-        ) -> Result<(), DeviceError> {
-            self.delete_calls.push(slot);
-
-            if self.fail_delete == Some(slot) {
-                return Err(DeviceError::DeleteCertificate {
-                    slot,
-                    source: PivError::GenericError,
-                });
-            }
-
-            let status = self.device_status(serial)?;
-            *Self::slot_status(status, slot) = SlotStatus::Empty;
-            Ok(())
-        }
     }
 
     fn foreign() -> SlotStatus {
@@ -612,7 +592,7 @@ mod tests {
         assert_eq!(
             provisioned,
             Provisioned {
-                pair_public_key: pair_key(),
+                pair_public_key: device.operator_public_key(),
                 provisioned_slots: vec![QosSlot::Signing, QosSlot::KeyAgreement],
             }
         );
@@ -636,7 +616,7 @@ mod tests {
         assert_eq!(
             provisioned,
             Provisioned {
-                pair_public_key: pair_key(),
+                pair_public_key: device.operator_public_key(),
                 provisioned_slots: Vec::new(),
             }
         );
@@ -778,6 +758,126 @@ mod tests {
         assert!(matches!(error, DeviceError::NotFound { serial } if serial == absent));
     }
 
+    #[test]
+    fn sign_produces_a_signature_verifiable_with_the_composite_key() {
+        let mut device = FakeDevice::new(SlotStatus::QosProvisioned, SlotStatus::QosProvisioned);
+        let message = b"manifest hash stand-in";
+
+        let signature = device
+            .sign(serial(), &Pin::from("123456".to_string()), message)
+            .unwrap();
+
+        let composite = hex::decode(device.operator_public_key().to_string()).unwrap();
+        P256Public::from_bytes(&composite)
+            .unwrap()
+            .verify(message, &signature)
+            .unwrap();
+    }
+
+    #[test]
+    fn sign_rejects_a_wrong_pin_with_the_retry_count() {
+        let mut device = FakeDevice::new(SlotStatus::QosProvisioned, SlotStatus::QosProvisioned);
+
+        let error = device
+            .sign(serial(), &Pin::from("999999".to_string()), b"message")
+            .unwrap_err();
+
+        assert!(matches!(error, DeviceError::WrongPin { tries: 3 }));
+    }
+
+    #[test]
+    fn sign_requires_a_provisioned_signing_slot() {
+        let mut device = FakeDevice::new(SlotStatus::Empty, SlotStatus::QosProvisioned);
+
+        let error = device
+            .sign(serial(), &Pin::from("123456".to_string()), b"message")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeviceError::EmptySlot {
+                slot: QosSlot::Signing
+            }
+        ));
+    }
+
+    #[test]
+    fn key_agreement_matches_a_software_shared_secret() {
+        let mut device = FakeDevice::new(SlotStatus::QosProvisioned, SlotStatus::QosProvisioned);
+        let sender = P256Pair::generate().unwrap();
+
+        let secret = device
+            .key_agreement(
+                serial(),
+                &Pin::from("123456".to_string()),
+                &sender.public_key().to_bytes()[..65],
+            )
+            .unwrap();
+
+        let composite = hex::decode(device.operator_public_key().to_string()).unwrap();
+        let device_encrypt_public = PublicKey::from_sec1_bytes(&composite[..65]).unwrap();
+        let expected = diffie_hellman(
+            sender.encryption_key().to_nonzero_scalar(),
+            device_encrypt_public.as_affine(),
+        );
+
+        assert_eq!(secret.as_slice(), expected.raw_secret_bytes().as_slice());
+    }
+
+    #[test]
+    fn key_agreement_requires_a_provisioned_key_agreement_slot() {
+        let mut device = FakeDevice::new(SlotStatus::QosProvisioned, SlotStatus::Empty);
+
+        let error = device
+            .key_agreement(serial(), &Pin::from("123456".to_string()), &[4u8; 65])
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeviceError::EmptySlot {
+                slot: QosSlot::KeyAgreement
+            }
+        ));
+    }
+
+    #[test]
+    fn verified_pair_public_key_returns_the_composite() {
+        let mut device = FakeDevice::new(SlotStatus::QosProvisioned, SlotStatus::QosProvisioned);
+
+        let key = device.verified_pair_public_key(serial()).unwrap();
+
+        assert_eq!(key, device.operator_public_key());
+    }
+
+    #[test]
+    fn verified_pair_public_key_refuses_a_foreign_slot() {
+        let mut device = FakeDevice::new(foreign(), SlotStatus::QosProvisioned);
+
+        let error = device.verified_pair_public_key(serial()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeviceError::ForeignSlot {
+                slot: QosSlot::Signing,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn verified_pair_public_key_refuses_an_empty_slot() {
+        let mut device = FakeDevice::new(SlotStatus::QosProvisioned, SlotStatus::Empty);
+
+        let error = device.verified_pair_public_key(serial()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeviceError::EmptySlot {
+                slot: QosSlot::KeyAgreement
+            }
+        ));
+    }
+
     fn org_with_operators(operators: Vec<OperatorRecord>) -> OrgConfig {
         OrgConfig {
             id: "org-id".to_string(),
@@ -866,6 +966,20 @@ mod tests {
         );
     }
 
+    fn sole_connected_serial(devices: &mut PcscDevices) -> YubiKeySerial {
+        let connected = devices.connected_serials().unwrap();
+
+        let [serial] = connected.as_slice() else {
+            panic!("connect exactly one YubiKey; found {connected:?}");
+        };
+
+        *serial
+    }
+
+    fn default_pin() -> Pin {
+        Pin::from(String::from_utf8(qos_client::yubikey::DEFAULT_PIN.to_vec()).unwrap())
+    }
+
     /// Full provision-inspect-delete cycle against real hardware.
     ///
     /// DESTRUCTIVE: generates keys in, and deletes the certificates from,
@@ -876,13 +990,8 @@ mod tests {
     #[ignore = "requires a connected YubiKey with default PIN/management key; overwrites its QuorumOS slots"]
     fn hardware_provision_and_delete_cycle() {
         let mut devices = PcscDevices;
-
-        let connected = devices.connected_serials().unwrap();
-        let [serial] = connected.as_slice() else {
-            panic!("connect exactly one YubiKey; found {connected:?}");
-        };
-        let serial = *serial;
-        let pin = Pin::from(String::from_utf8(qos_client::yubikey::DEFAULT_PIN.to_vec()).unwrap());
+        let serial = sole_connected_serial(&mut devices);
+        let pin = default_pin();
 
         let provisioned = devices.ensure_provisioned(serial, &pin).unwrap();
         assert_eq!(
@@ -910,5 +1019,70 @@ mod tests {
                 key_agreement: SlotStatus::Empty,
             }
         );
+    }
+
+    /// Signing and key agreement against real hardware.
+    ///
+    /// DESTRUCTIVE: provisions the QuorumOS slots of the sole connected
+    /// YubiKey when they are empty, and leaves them provisioned. Requires
+    /// the factory-default PIN and management key; sign and key agreement
+    /// each need a touch while the device blinks. Run manually:
+    /// `cargo test -p tvc --lib -- --ignored hardware_`
+    #[test]
+    #[ignore = "requires a connected YubiKey with default PIN/management key; provisions its QuorumOS slots"]
+    fn hardware_sign_and_key_agreement() {
+        let mut devices = PcscDevices;
+        let serial = sole_connected_serial(&mut devices);
+        let pin = default_pin();
+
+        let absent = YubiKeySerial::from(0x0000_0001);
+        assert!(matches!(
+            devices.status(absent).unwrap_err(),
+            DeviceError::NotFound { .. }
+        ));
+
+        let provisioned = devices.ensure_provisioned(serial, &pin).unwrap();
+        let verified = devices.verified_pair_public_key(serial).unwrap();
+        assert_eq!(verified, provisioned.pair_public_key);
+        let composite = hex::decode(verified.to_string()).unwrap();
+
+        let message = b"tvc hardware signing test";
+        let signature = devices.sign(serial, &pin, message).unwrap();
+        P256Public::from_bytes(&composite)
+            .unwrap()
+            .verify(message, &signature)
+            .unwrap();
+
+        let sender = P256Pair::generate().unwrap();
+        let secret = devices
+            .key_agreement(serial, &pin, &sender.public_key().to_bytes()[..65])
+            .unwrap();
+        let device_encrypt_public = PublicKey::from_sec1_bytes(&composite[..65]).unwrap();
+        let expected = diffie_hellman(
+            sender.encryption_key().to_nonzero_scalar(),
+            device_encrypt_public.as_affine(),
+        );
+        assert_eq!(secret.as_slice(), expected.raw_secret_bytes().as_slice());
+    }
+
+    /// Wrong-PIN reporting against real hardware.
+    ///
+    /// Burns one PIN retry with a deliberately wrong PIN, then restores the
+    /// counter by signing with the factory-default PIN (one touch). Requires
+    /// a provisioned device — run `hardware_sign_and_key_agreement` first.
+    #[test]
+    #[ignore = "requires a provisioned YubiKey with default PIN; burns and restores one PIN retry"]
+    fn hardware_wrong_pin_reports_retries() {
+        let mut devices = PcscDevices;
+        let serial = sole_connected_serial(&mut devices);
+
+        let error = devices
+            .sign(serial, &Pin::from("999999".to_string()), b"wrong pin probe")
+            .unwrap_err();
+        assert!(matches!(error, DeviceError::WrongPin { .. }));
+
+        devices
+            .sign(serial, &default_pin(), b"restore the retry counter")
+            .unwrap();
     }
 }
