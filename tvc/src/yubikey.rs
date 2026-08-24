@@ -529,6 +529,14 @@ impl Config {
         }
     }
 
+    /// The registry entry for a serial, when it is registered.
+    pub(crate) fn yubikey_registry_entry(
+        &self,
+        serial: YubiKeySerial,
+    ) -> Option<&YubiKeyRegistryEntry> {
+        self.yubikeys.iter().find(|entry| entry.serial == serial)
+    }
+
     /// Remove a serial from the device registry. Returns `false` when it was
     /// not registered.
     pub(crate) fn deregister_yubikey(&mut self, serial: YubiKeySerial) -> bool {
@@ -557,6 +565,8 @@ impl Config {
         aliases
     }
 }
+
+pub(crate) mod pair;
 
 #[cfg(test)]
 pub(crate) mod test_support;
