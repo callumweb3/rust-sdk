@@ -167,17 +167,13 @@ impl DeviceOps for FakeDevice {
         &mut self,
         serial: YubiKeySerial,
         pin: &Pin,
-        sender_public: &[u8],
+        sender_public: PublicKey,
     ) -> Result<Zeroizing<Vec<u8>>, DeviceError> {
         self.checked_slot(serial, pin, QosSlot::KeyAgreement)?;
 
-        let sender =
-            PublicKey::from_sec1_bytes(sender_public).map_err(|_| DeviceError::KeyAgreement {
-                error: YubiKeyError::KeyAgreementFailed,
-            })?;
         let secret = diffie_hellman(
             self.pair.encryption_key().to_nonzero_scalar(),
-            sender.as_affine(),
+            sender_public.as_affine(),
         );
 
         Ok(Zeroizing::new(secret.raw_secret_bytes().to_vec()))

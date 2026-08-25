@@ -21,6 +21,8 @@ use crate::config::turnkey::{
     Config, OperatorRecordKind, QosOperatorPublicKey, QosOperatorPublicKeyParseError,
     YubiKeyRegistryEntry, YubiKeySerial,
 };
+use p256::PublicKey;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use qos_client::yubikey::{KEY_AGREEMENT_SLOT, SIGNING_SLOT, YubiKeyError};
 use std::fmt::{self, Display, Formatter};
 use yubikey::{
@@ -258,14 +260,13 @@ pub(crate) trait DeviceOps {
         message: &[u8],
     ) -> Result<Vec<u8>, DeviceError>;
 
-    /// Raw ECDH between the key-agreement slot key and `sender_public`, an
-    /// uncompressed SEC1-encoded P-256 point. Requires the PIN and a
-    /// physical touch.
+    /// Raw ECDH between the key-agreement slot key and `sender_public`.
+    /// Requires the PIN and a physical touch.
     fn key_agreement(
         &mut self,
         serial: YubiKeySerial,
         pin: &Pin,
-        sender_public: &[u8],
+        sender_public: PublicKey,
     ) -> Result<Zeroizing<Vec<u8>>, DeviceError>;
 
     /// Bring the device to the fully provisioned state and return its
@@ -479,18 +480,18 @@ impl DeviceOps for PcscDevices {
         &mut self,
         serial: YubiKeySerial,
         pin: &Pin,
-        sender_public: &[u8],
+        sender_public: PublicKey,
     ) -> Result<Zeroizing<Vec<u8>>, DeviceError> {
         let mut yubikey = Self::open(serial)?;
+        let sender_point = sender_public.to_encoded_point(false);
 
-        qos_client::yubikey::key_agreement(&mut yubikey, sender_public, pin.as_bytes()).map_err(
-            |error| match error {
+        qos_client::yubikey::key_agreement(&mut yubikey, sender_point.as_bytes(), pin.as_bytes())
+            .map_err(|error| match error {
                 YubiKeyError::FailedToVerifyPin(PivError::WrongPin { tries }) => {
                     DeviceError::WrongPin { tries }
                 }
                 error => DeviceError::KeyAgreement { error },
-            },
-        )
+            })
     }
 }
 
@@ -820,7 +821,7 @@ mod tests {
             .key_agreement(
                 serial(),
                 &Pin::from("123456".to_string()),
-                &sender.public_key().to_bytes()[..65],
+                sender.encryption_key().public_key(),
             )
             .unwrap();
 
@@ -837,9 +838,14 @@ mod tests {
     #[test]
     fn key_agreement_requires_a_provisioned_key_agreement_slot() {
         let mut device = FakeDevice::new(SlotStatus::QosProvisioned, SlotStatus::Empty);
+        let sender = P256Pair::generate().unwrap();
 
         let error = device
-            .key_agreement(serial(), &Pin::from("123456".to_string()), &[4u8; 65])
+            .key_agreement(
+                serial(),
+                &Pin::from("123456".to_string()),
+                sender.encryption_key().public_key(),
+            )
             .unwrap_err();
 
         assert!(matches!(
@@ -1065,7 +1071,7 @@ mod tests {
 
         let sender = P256Pair::generate().unwrap();
         let secret = devices
-            .key_agreement(serial, &pin, &sender.public_key().to_bytes()[..65])
+            .key_agreement(serial, &pin, sender.encryption_key().public_key())
             .unwrap();
         let device_encrypt_public = PublicKey::from_sec1_bytes(&composite[..65]).unwrap();
         let expected = diffie_hellman(
