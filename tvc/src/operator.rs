@@ -13,12 +13,15 @@ pub(crate) use hosted::{ResolvedHostedOperator, hosted_activity_error};
 use crate::{
     approvals::ValidatedManifest,
     client::build_client,
-    config::turnkey::{Config, OperatorKind, StoredQosOperatorKey},
+    config::turnkey::{Config, OperatorKind, StoredQosOperatorKey, YubiKeySerial},
     local_operator_key::{
         LocalOperatorSeedSource, resolve_local_operator, resolve_registered_local_operator,
     },
     pair::{Pair, Signer},
-    yubikey::{DeviceOps, pair::PinAcquisition},
+    yubikey::{
+        DeviceOps,
+        pair::{AvailablePin, PinAcquisition},
+    },
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use hosted::HostedSigner;
@@ -26,6 +29,7 @@ use p256::{PublicKey, elliptic_curve::sec1::ToEncodedPoint};
 use qos_core::protocol::services::boot::Approval;
 use std::{
     fmt::{self, Debug, Display, Formatter},
+    path::PathBuf,
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -184,6 +188,43 @@ impl Display for OperatorCandidate {
     }
 }
 
+/// A share-decryption backend selected by
+/// [`Config::select_operator_pair_source`] from config and interaction mode
+/// alone. [`Self::resolve`] performs the I/O: file reads, device
+/// verification, and the PIN prompt.
+pub(crate) enum OperatorPairSource {
+    /// An explicit seed from the command line.
+    Seed(LocalOperatorSeedSource),
+    /// The sole registered local operator's key file.
+    RegisteredKeyFile(PathBuf),
+    /// The sole registered yubikey operator's device.
+    Yubikey {
+        serial: YubiKeySerial,
+        pin: AvailablePin,
+    },
+}
+
+impl OperatorPairSource {
+    /// Resolve the selected backend into a usable pair.
+    pub(crate) async fn resolve<D: DeviceOps + Send + 'static>(
+        self,
+        config: &Config,
+        devices: D,
+    ) -> Result<Box<dyn Pair>> {
+        match self {
+            Self::Seed(source) => Ok(Box::new(
+                resolve_local_operator(config, Some(source)).await?,
+            )),
+            Self::RegisteredKeyFile(path) => {
+                Ok(Box::new(resolve_registered_local_operator(path).await?))
+            }
+            Self::Yubikey { serial, pin } => Ok(Box::new(
+                config.resolve_yubikey(serial, devices, pin).await?,
+            )),
+        }
+    }
+}
+
 /// Operator semantics of the registry [`Config`] holds; the methods live
 /// here, with the rest of operator resolution, rather than in the config
 /// module.
@@ -319,6 +360,7 @@ impl Config {
                 let (operator, yubikey) = org
                     .select_yubikey_operator()
                     .with_context(|| format!("org '{alias}'"))?;
+                let pin = pin.into_available()?;
                 let pair = self.resolve_yubikey(yubikey.serial, devices, pin).await?;
 
                 Ok(ResolvedOperator {
@@ -363,19 +405,20 @@ impl Config {
         }
     }
 
-    /// Resolve the operator key pair for share decryption by the active
-    /// org's default backend. An explicit seed is local, always, and skips
-    /// the config. Hosted operators sign through the API and hold no local
-    /// key material, so a hosted default is redirected to the hosted
-    /// counterpart of the flow.
-    pub(crate) async fn resolve_operator_pair<D: DeviceOps + Send + 'static>(
+    /// Select the share-decryption backend from config and interaction mode
+    /// alone — deterministic and I/O-free, so endpoints refuse impossible
+    /// runs before doing unrelated work; [`OperatorPairSource::resolve`]
+    /// performs the I/O. An explicit seed is local, always, and skips the
+    /// config. Hosted operators sign through the API and hold no local key
+    /// material, so a hosted default is redirected to the hosted counterpart
+    /// of the flow.
+    pub(crate) fn select_operator_pair_source(
         &self,
-        devices: D,
         explicit: Option<LocalOperatorSeedSource>,
         pin: PinAcquisition,
-    ) -> Result<Box<dyn Pair>> {
-        if explicit.is_some() {
-            return Ok(Box::new(resolve_local_operator(self, explicit).await?));
+    ) -> Result<OperatorPairSource> {
+        if let Some(explicit) = explicit {
+            return Ok(OperatorPairSource::Seed(explicit));
         }
 
         let (alias, org) = self.active_org_config().ok_or_else(|| {
@@ -391,8 +434,8 @@ impl Config {
                     .select_local_operator()
                     .with_context(|| format!("org '{alias}'"))?;
 
-                Ok(Box::new(
-                    resolve_registered_local_operator(local.key_path.clone()).await?,
+                Ok(OperatorPairSource::RegisteredKeyFile(
+                    local.key_path.clone(),
                 ))
             }
             OperatorKind::Yubikey => {
@@ -400,9 +443,10 @@ impl Config {
                     .select_yubikey_operator()
                     .with_context(|| format!("org '{alias}'"))?;
 
-                Ok(Box::new(
-                    self.resolve_yubikey(yubikey.serial, devices, pin).await?,
-                ))
+                Ok(OperatorPairSource::Yubikey {
+                    serial: yubikey.serial,
+                    pin: pin.into_available()?,
+                })
             }
             // TODO(TVC-202): remove hardcoded user-facing messages mentioning
             // other commands.
@@ -721,14 +765,14 @@ mod tests {
 
         // The pair never needs a PIN on the local path, even when none could
         // be prompted.
-        let pair = Config::default()
-            .resolve_operator_pair(
-                provisioned_fake(),
+        let config = Config::default();
+        let source = config
+            .select_operator_pair_source(
                 Some(LocalOperatorSeedSource::Value(seed_hex.parse().unwrap())),
                 PinAcquisition::Unavailable,
             )
-            .await
             .unwrap();
+        let pair = source.resolve(&config, provisioned_fake()).await.unwrap();
 
         assert_eq!(pair.public_key(), expected);
     }
@@ -757,10 +801,10 @@ mod tests {
         }]);
         let expected = LocalPair::from_hex_seed(&private_key).unwrap().public_key();
 
-        let pair = config
-            .resolve_operator_pair(provisioned_fake(), None, PinAcquisition::Unavailable)
-            .await
+        let source = config
+            .select_operator_pair_source(None, PinAcquisition::Unavailable)
             .unwrap();
+        let pair = source.resolve(&config, provisioned_fake()).await.unwrap();
 
         assert_eq!(pair.public_key(), expected);
     }
@@ -771,22 +815,34 @@ mod tests {
         let composite = device.operator_public_key();
         let config = registered_yubikey_config(&device);
 
-        let pair = config
-            .resolve_operator_pair(device, None, fixed_pin())
-            .await
+        let source = config
+            .select_operator_pair_source(None, fixed_pin())
             .unwrap();
+        let pair = source.resolve(&config, device).await.unwrap();
 
         assert_eq!(pair.public_key(), composite.as_bytes());
     }
 
-    #[tokio::test]
-    async fn operator_pair_hosted_default_is_redirected() {
+    #[test]
+    fn operator_pair_yubikey_default_without_a_pin_is_refused_at_selection() {
+        let device = provisioned_fake();
+        let config = registered_yubikey_config(&device);
+
+        let error = config
+            .select_operator_pair_source(None, PinAcquisition::Unavailable)
+            .err()
+            .expect("selection must refuse an unavailable PIN");
+
+        assert!(format!("{error:#}").contains("interactive prompt"));
+    }
+
+    #[test]
+    fn operator_pair_hosted_default_is_redirected() {
         let mut config = config_with_operators(vec![hosted_operator("hosted")]);
         config.orgs.get_mut("active").unwrap().default_operator_kind = OperatorKind::Hosted;
 
         let error = config
-            .resolve_operator_pair(provisioned_fake(), None, PinAcquisition::Unavailable)
-            .await
+            .select_operator_pair_source(None, PinAcquisition::Unavailable)
             .err()
             .expect("a hosted default cannot decrypt locally");
 
